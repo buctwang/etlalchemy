@@ -4,15 +4,16 @@ import datetime
 # Find the best implementation available on this platform
 try:
     from cStringIO import StringIO
-except ImportError:
+except:
     try:
         from StringIO import StringIO
     except ImportError:
         from io import StringIO
-    
+
 def _generate_literal_value_for_csv(value, dialect):
     dialect_name = dialect.name.lower()
-    
+
+    basestring = (str, bytes)
     if isinstance(value, basestring):
         if dialect_name in ['sqlite', 'mssql']:
             # No support for 'quote' enclosed strings
@@ -24,7 +25,7 @@ def _generate_literal_value_for_csv(value, dialect):
         return "NULL"
     elif isinstance(value, bool):
         return "%s" % int(value)
-    elif isinstance(value, (float, int, long)):
+    elif isinstance(value, (float, int)):
         return "%s" % value
     elif isinstance(value, decimal.Decimal):
         return str(value)

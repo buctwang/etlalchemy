@@ -143,10 +143,21 @@ class ETLAlchemySource():
         self.times = {}  # Map Tables to Names...
 
     def get_nearest_power_of_two(self, num):
+        # This is optimized for MySQL: we want to optimize
+        # cache hits by defining our column sizes as small
+        # as possible, to the nearest power of 2.
         i = 2
-        while i < num:
-            i *= 2
-        return i
+        if num < 256:
+            # Disk space is L + 1 byte for length (1 - 255)
+            while (i-1) < num:
+                i *= 2
+            return i - 1
+        else:
+            # Disk space is L + 2 bytes for length (256 - 65536)
+            while (i-2) < num:
+                i *= 2
+            return i - 2
+
 
     def standardize_column_type(self, column, raw_rows):
         old_column_class = column.type.__class__
@@ -160,6 +171,7 @@ class ETLAlchemySource():
         """"""""""""""""""""""""""""""""
         """ *** STANDARDIZATION *** """
         """"""""""""""""""""""""""""""""
+        print(self.current_ordered_table_columns)
         idx = self.current_ordered_table_columns.index(column.name)
         ##############################
         # Duck-typing to remove
@@ -210,20 +222,29 @@ class ETLAlchemySource():
                         row[idx] = row[idx].encode('utf-8', 'ignore')
                     else:
                         row[idx] = row[idx].decode('utf-8', 'ignore').encode('utf-8')
-            if max_data_length > 0:
-                # The column is not empty...
-                column_size = self.get_nearest_power_of_two(max_data_length)
-                column_copy.type = String(column_size)
-                self.logger.info("Converting to -> VARCHAR({0} (maxsize: {1})".format(str(column_size), str(max_data_length)))
-            elif varchar_length > 0:
-                # The column is empty BUT has a predfined size
-                column_size = self.get_nearest_power_of_two(varchar_length)
-                column_copy.type = String(column_size)
-                self.logger.info("Converting to -> VARCHAR({0} (prevsize: {1})".format(str(column_size), str(varchar_length)))
+            if self.compress_varchar:
+                # Let's reduce the "n" in VARCHAR(n) to a power of 2
+                if max_data_length > 0:
+                    # The column is not empty...
+                    column_size = self.get_nearest_power_of_two(max_data_length)
+                    column_copy.type = String(column_size)
+                    self.logger.info("Converting to -> VARCHAR({0}) (max_data_length: {1})".format(str(column_size), str(max_data_length)))
+                elif varchar_length > 0:
+                    # The column is empty BUT has a predfined size
+                    column_size = self.get_nearest_power_of_two(varchar_length)
+                    column_copy.type = String(column_size)
+                    self.logger.info("Converting to -> VARCHAR({0}) (prev varchar size: {1})".format(str(column_size), str(varchar_length)))
+                else:
+                    # The column is empty and has NO predefined size
+                    column_copy.type = Text()
+                    self.logger.info("Converting to Text()")
             else:
-                # The column is empty and has NO predefined size
-                column_copy.type = Text()
-                self.logger.info("Converting to Text()")
+                if varchar_length > 0:
+                    column_copy.type = String(varchar_length)
+                else:
+                    # The column has NO predefined size
+                    column_copy.type = Text()
+                    self.logger.info("Converting to Text()")
         elif "UNICODE" in base_classes:
             #########################################
             # Get the VARCHAR size of the column...
@@ -285,7 +306,7 @@ class ETLAlchemySource():
             ####################################
             mantissa_max_digits = 0
             left_hand_max_digits = 0
-            mantissa_max_value = 0
+            mantissa_gt_zero = False
             intCount = 0
             maxDigit = 0
             type_count = {}
@@ -322,8 +343,11 @@ class ETLAlchemySource():
                                               len(mantissa_digits))
                     left_hand_max_digits = max(left_hand_max_digits,
                                                len(left_hand_digits))
-                    mantissa_max_value = max(int(mantissa_digits),
-                                             mantissa_max_value)
+                    # If we have a mantissa greater than zero, we can keep this column as a decimal
+                    if not mantissa_gt_zero and float(mantissa_digits) > 0:
+                        # Short circuit the above 'and' so we don't keep resetting mantissa_gt_zero
+                        mantissa_gt_zero = True
+
                 elif data.__class__.__name__ == 'int':
                     intCount += 1
                     maxDigit = max(data, maxDigit)
@@ -333,7 +357,7 @@ class ETLAlchemySource():
             #self.logger.info("Max Mantissa Digits: {0}".format(str(mantissa_max_digits)))
             #self.logger.info("Max Left Hand Digit: {0}".format(str(left_hand_max_digits)))
             #self.logger.info("Total Left Max Digits: {0}".format(str(max(len(str(maxDigit)), left_hand_max_digits))))
-            if mantissa_max_value > 0:
+            if mantissa_gt_zero:
                 cum_max_left_digits = max(
                     len(str(maxDigit)), (left_hand_max_digits))
                 self.logger.info("Numeric({0}, {1})".format(str(cum_max_left_digits + mantissa_max_digits), str(mantissa_max_digits)))
@@ -351,7 +375,7 @@ class ETLAlchemySource():
                         "Column '" +
                         column.name +
                         "' is a primary key, but is of type 'Decimal'")
-            elif mantissa_max_value == 0:
+            else:
                 self.logger.warning(
                     "Column '" +
                     column.name +
@@ -456,10 +480,10 @@ class ETLAlchemySource():
         idx = self.current_ordered_table_columns.index(column.name)
         
         cname = column_copy.name
-        columnHasGloballyIgnoredSuffix = len(
+        columnHasGloballyIgnoredSuffix = len(list(
             filter(
                 lambda s: cname.find(s) > -1,
-                self.global_ignored_col_suffixes)) > 0
+                self.global_ignored_col_suffixes))) > 0
 
         oldColumns = self.current_ordered_table_columns
         oldColumnsLength = len(self.current_ordered_table_columns)
@@ -647,7 +671,7 @@ class ETLAlchemySource():
                        "--compress "
                        "--local "
                        "--fields-terminated-by=\",\" "
-                       "--fields-enclosed-by=\"'\" "
+                       "--fields-enclosed-by='\"' "
                        "--fields-escaped-by='\\' "
                        # "--columns={3} "
                        "--lines-terminated-by=\"\n\" "
@@ -814,7 +838,7 @@ class ETLAlchemySource():
                 uid = ""
                 row = raw_rows[r]
                 for pk in pks:
-                    uid += str(row[self.current_ordered_table_columns[pk]])
+                    uid += str(row[self.current_ordered_table_columns.index(pk)])
                 if upsertDict.get(uid):
                     with open(data_file_path, "a+") as fp:
                         stmt = T.update()\
@@ -826,7 +850,7 @@ class ETLAlchemySource():
                                        pks))))\
                                .values(dict(zip(
                                    self.current_ordered_table_columns, row)))
-                        dump_sql_statement(stmt, fp, self.dst_engine, T.name)
+                        dump_to_sql_statement(stmt, fp, self.dst_engine, T.name)
                     del raw_rows[r]
             #################################
             # Insert the remaining rows...
@@ -843,7 +867,7 @@ class ETLAlchemySource():
                     " ({0}) -- Inserting remaining '{0}' rows."
                     .format(str(raw_row_len)))
                 with open(data_file_path, "a+") as fp:
-                    dump_sql_statement(
+                    dump_to_sql_statement(
                         T.insert().values(raw_rows), fp,
                         self.dst_engine, T.name)
         conn.close()
@@ -961,12 +985,13 @@ class ETLAlchemySource():
                 #########################################################
                 # Generate the mapping of 'column_name' -> 'list index'
                 ########################################################
-                cols = map(lambda c: c.name, T_src.columns)
+                cols = list(map(lambda c: c.name, T_src.columns))
                 self.current_ordered_table_columns = [None] * len(cols)
                 self.original_ordered_table_columns = [None] * len(cols)
                 for i in range(0, len(cols)):
                     self.original_ordered_table_columns[i] = cols[i]
                     self.current_ordered_table_columns[i] = cols[i]
+                    print("$$$$$$$")
                 ###################################
                 # Grab raw rows for data type checking...
                 ##################################
@@ -982,7 +1007,7 @@ class ETLAlchemySource():
                 self.logger.info("Loading all rows into memory...")
                 rows = []
 
-                for i in range(1, (cnt / buffer_size) + 1):
+                for i in range(1, (cnt // buffer_size) + 1):
                     self.logger.info(
                         "Fetched {0} rows".format(str(i * buffer_size)))
                     rows += resultProxy.fetchmany(buffer_size)
@@ -1000,8 +1025,6 @@ class ETLAlchemySource():
 
                 # TODO: Use column/table mappers, would need to update foreign
                 # keys...
-                
-
             
                 for column in T_src.columns:
                     self.column_count += 1
@@ -1083,7 +1106,7 @@ class ETLAlchemySource():
                     # Create buffers of "100000" rows
                     # TODO: Parameterize "100000" as 'buffer_size' (should be
                     # configurable)
-                    insertionCount = (len(raw_rows) / row_buffer_size) + 1
+                    insertionCount = (len(raw_rows) // row_buffer_size) + 1
                     raw_row_len = len(raw_rows)
                     self.total_rows += raw_row_len
                     if len(raw_rows) > 0:
@@ -1473,8 +1496,8 @@ class ETLAlchemySource():
                      ref_column_transformer[c].newColumns not in ["", None]:
                         c = ref_column_transformer[c].newColumn
                     ref_columns.append(c)
-                referred_columns = map(
-                    lambda x: T_ref.columns.get(x), ref_columns)
+                referred_columns = list(map(
+                    lambda x: T_ref.columns.get(x), ref_columns))
                 self.logger.info("Ref Columns: " + str(ref_columns))
                 if len(referred_columns) < len(fk['referred_columns']):
                     self.logger.warning("Skipping FK constraint '" +
@@ -1681,12 +1704,12 @@ class ETLAlchemySource():
                 _____
              _.'_____`._
            .'.-'  12 `-.`.
-          /,' 11      1 `.\/
-         // 10      /   2 \|
+          /,' 11      1 `.\\
+         // 10      /   2 \\\\
         ;;         /       ::
         || 9  ----O      3 ||
         ::                 ;;
-         \\ 8           4 //
+         \\\\ 8           4 //
           \`. 7       5 ,'/
            '.`-.__6__.-'.'
             ((-._____.-))
@@ -1701,7 +1724,7 @@ class ETLAlchemySource():
             "Load Time (Into Target)",
             "Indexing Time",
             "Constraint Time"]
-        for (table_name, timings) in self.times.iteritems():
+        for (table_name, timings) in self.times.items():
             self.logger.info(table_name)
             for key in ordered_timings:
                 self.logger.info("-- " + str(key) + ": " +
